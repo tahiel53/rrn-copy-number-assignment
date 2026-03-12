@@ -1,0 +1,256 @@
+---
+title: "rrn copy number assignment — example analysis"
+author: "Tahiel Maccario"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+## Overview
+
+This document illustrates how to use the output of `hsp.py` to assign rrn copy
+numbers to ASVs and classify them into trophic strategies. It assumes you have
+already run the pipeline described in the repository README.
+
+The inputs needed are:
+
+| File | Description |
+|------|-------------|
+| `your_taxonomy.csv` | Taxonomy table with one row per ASV |
+| `your_otu_table.tsv` | OTU/ASV abundance table (ASVs × samples) |
+| `rrn_copies_estimated.tsv` | Output of `hsp.py` |
+
+---
+
+## Load data
+
+```{r load-data}
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(patchwork)
+library(knitr)
+library(kableExtra)
+
+# ── Paths ──────────────────────────────────────────────────────────────────────
+# Adjust these paths to match your project structure
+tax_table  <- read.csv("your_taxonomy.csv")
+otu_table  <- read.table("your_otu_table.tsv", sep = "\t", header = TRUE)
+rrn_raw    <- read.table("rrn_copies_estimated.tsv", sep = "\t", header = TRUE)
+```
+
+The taxonomy table should have at minimum an `ASV` column and taxonomic rank
+columns (`Phylum`, `Class`, etc.). The OTU table should have ASVs as rows and
+samples as columns, with an `ASV` identifier column.
+
+---
+
+## Merge copy numbers into the taxonomy table
+
+```{r merge}
+# Long-format OTU table for per-sample operations
+otu_long <- otu_table %>%
+  pivot_longer(cols = -ASV, names_to = "sample", values_to = "abundance")
+
+# Total abundance per ASV across all samples (used for weighted summaries)
+asv_total_abundance <- otu_long %>%
+  group_by(ASV) %>%
+  summarise(total_abundance = sum(abundance, na.rm = TRUE), .groups = "drop")
+
+# Join copy numbers and NSTI into the taxonomy table
+taxonomy_final <- tax_table %>%
+  left_join(asv_total_abundance, by = "ASV") %>%
+  left_join(
+    rrn_raw %>% select(
+      ASV   = sequence,
+      rrn   = metadata_mean_16S_rRNA_Count,
+      NSTI  = metadata_NSTI
+    ),
+    by = "ASV"
+  )
+```
+
+---
+
+## Classify trophic strategy
+
+Following [Klappenbach et al. (2000)](https://doi.org/10.1128/AEM.66.4.1328-1333.2000)
+and [Gao & Wu (2019)](https://doi.org/10.1101/350348):
+
+| Category | rrn copies |
+|----------|-----------|
+| Oligotroph | 1–2 |
+| Intermediate | 3–4 |
+| Copiotroph | ≥5 |
+
+```{r classify}
+taxonomy_final <- taxonomy_final %>%
+  mutate(
+    strategy = case_when(
+      rrn <= 2              ~ "Oligotroph",
+      rrn >= 5              ~ "Copiotroph",
+      !is.na(rrn)           ~ "Intermediate",
+      TRUE                  ~ NA_character_
+    ),
+    strategy = factor(strategy, levels = c("Oligotroph", "Intermediate", "Copiotroph"))
+  )
+```
+
+---
+
+## Summary tables
+
+### ASVs per trophic strategy
+
+```{r table-asvs}
+taxonomy_final %>%
+  filter(!is.na(strategy)) %>%
+  count(strategy) %>%
+  kable(caption = "Number of ASVs per trophic strategy",
+        format.args = list(big.mark = ",")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE)
+```
+
+### Total read abundance per trophic strategy
+
+```{r table-abundance}
+taxonomy_final %>%
+  filter(!is.na(strategy)) %>%
+  group_by(strategy) %>%
+  summarise(total_reads = sum(total_abundance, na.rm = TRUE), .groups = "drop") %>%
+  kable(caption = "Total read abundance per trophic strategy",
+        format.args = list(big.mark = ",")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE)
+```
+
+---
+
+## Placement quality (NSTI)
+
+The NSTI (Nearest Sequenced Taxon Index) reflects the phylogenetic distance
+between each ASV and its nearest reference in rrnDB. Lower values indicate
+more reliable copy number estimates.
+
+```{r nsti-table}
+taxonomy_final %>%
+  filter(!is.na(NSTI)) %>%
+  summarise(
+    `NSTI < 0.15` = sum(NSTI < 0.15),
+    `NSTI < 0.50` = sum(NSTI < 0.50),
+    `NSTI < 2.00` = sum(NSTI < 2.00),
+    `Total with NSTI` = n()
+  ) %>%
+  kable(caption = "ASVs by NSTI threshold",
+        format.args = list(big.mark = ",")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE)
+```
+
+```{r nsti-hist, fig.width=6, fig.height=4}
+taxonomy_final %>%
+  filter(!is.na(NSTI)) %>%
+  ggplot(aes(x = NSTI)) +
+  geom_histogram(bins = 80, fill = "steelblue", color = "white", linewidth = 0.2) +
+  geom_vline(xintercept = c(0.15, 0.50), linetype = "dashed",
+             color = c("orange", "red")) +
+  annotate("text", x = 0.17, y = Inf, label = "0.15", vjust = 2,
+           hjust = 0, color = "orange", size = 3) +
+  annotate("text", x = 0.52, y = Inf, label = "0.50", vjust = 2,
+           hjust = 0, color = "red", size = 3) +
+  labs(x = "NSTI", y = "Number of ASVs",
+       title = "Distribution of NSTI values") +
+  theme_minimal()
+```
+
+High NSTI values are expected for samples from poorly characterized environments
+(e.g., freshwater systems from underrepresented regions) where rrnDB coverage is
+limited.
+
+---
+
+## rrn copy number by phylum
+
+```{r boxplot-phylum, fig.width=10, fig.height=7}
+# Select the 15 most abundant phyla
+top_phyla <- otu_long %>%
+  left_join(tax_table %>% select(ASV, Phylum), by = "ASV") %>%
+  filter(!is.na(Phylum)) %>%
+  group_by(Phylum) %>%
+  summarise(total_abundance = sum(abundance, na.rm = TRUE), .groups = "drop") %>%
+  arrange(desc(total_abundance)) %>%
+  slice_head(n = 15) %>%
+  pull(Phylum)
+
+# Order phyla by median rrn copy number
+phylum_order <- taxonomy_final %>%
+  filter(Phylum %in% top_phyla, !is.na(rrn)) %>%
+  group_by(Phylum) %>%
+  summarise(med_rrn = median(rrn), .groups = "drop") %>%
+  arrange(med_rrn) %>%
+  pull(Phylum)
+
+plot_data <- taxonomy_final %>%
+  filter(Phylum %in% top_phyla, !is.na(rrn)) %>%
+  mutate(Phylum = factor(Phylum, levels = phylum_order)) %>%
+  arrange(total_abundance)   # most abundant points drawn on top
+
+# Weighted mean and SD per phylum (for the annotation table)
+stats <- plot_data %>%
+  group_by(Phylum) %>%
+  summarise(
+    wmean = round(sum(rrn * total_abundance) / sum(total_abundance), 2),
+    wsd   = round(sqrt(sum(total_abundance * (rrn - sum(rrn * total_abundance) /
+                              sum(total_abundance))^2) / sum(total_abundance)), 2),
+    .groups = "drop"
+  ) %>%
+  mutate(Phylum = factor(Phylum, levels = phylum_order))
+
+tbl <- stats %>%
+  pivot_longer(cols = c(wmean, wsd), names_to = "stat", values_to = "value") %>%
+  mutate(value = as.character(value)) %>%
+  ggplot(aes(x = stat, y = Phylum, label = value)) +
+  geom_text(size = 3.2) +
+  scale_x_discrete(labels = c(wmean = "", wsd = "")) +
+  labs(title = "Wtd. mean   Wtd. SD") +
+  theme_void() +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 9),
+        plot.margin = margin(5, 5, 5, 0))
+
+bp <- ggplot(plot_data, aes(x = Phylum, y = rrn)) +
+  geom_boxplot(fill = "lightblue", color = "black", outlier.shape = NA) +
+  stat_summary(fun = median, geom = "crossbar",
+               width = 0.6, color = "darkorange", linewidth = 0.8) +
+  geom_jitter(aes(color = total_abundance, size = total_abundance),
+              width = 0.2, alpha = 0.6) +
+  geom_hline(yintercept = 2.5, linetype = "dashed", color = "red") +
+  coord_flip() +
+  scale_color_viridis_c(name = "Total ASV\nabundance (log10)", trans = "log10") +
+  scale_size_continuous(trans = "log10", range = c(0.5, 3), guide = "none") +
+  labs(x = "Phylum", y = "16S rRNA copy number (rrnDB)",
+       title = "rrn copy number by phylum (top 15 by abundance)") +
+  theme_minimal() +
+  theme(plot.margin = margin(5, 0, 5, 5))
+
+(bp | tbl) + plot_layout(widths = c(5, 2))
+```
+
+The dashed red line marks the threshold between oligotrophs (≤2 copies) and
+intermediates (≥3 copies). Points are colored and sized by total ASV abundance
+across all samples.
+
+---
+
+## References
+
+- Klappenbach JA, Dunbar JM, Schmidt TM. 2000. rRNA operon copy number reflects ecological strategies of bacteria. *Appl Environ Microbiol* 66:1328–1333.
+- Gao Y, Wu M. 2019. Free-living bacterial communities are mostly dominated by oligotrophs. *bioRxiv* doi:10.1101/350348.
+- Douglas GM et al. 2020. PICRUSt2 for prediction of metagenome functions. *Nat Biotechnol* 38:685–688.

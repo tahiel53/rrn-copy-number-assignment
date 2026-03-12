@@ -1,0 +1,29 @@
+# Large reference/alignment files (distribute via Releases or LFS)
+*.fasta
+*.fna
+*.treefile
+*.hmm
+*.tsv
+*.jplace
+
+# But keep the example analysis Rmd and READMEs
+!example_analysis/*.Rmd
+!**/README.md
+
+# R
+.Rhistory
+.RData
+.Rproj.user/
+*.Rproj
+
+# Python
+__pycache__/
+*.py[cod]
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Intermediate files
+placement_working/
+placement_output/
